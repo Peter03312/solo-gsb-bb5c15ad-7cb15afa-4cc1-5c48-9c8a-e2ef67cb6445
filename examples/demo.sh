@@ -115,3 +115,38 @@ step "本轮读完（has_more=false）后开启新一轮：不传 upper，从 ne
 req GET "/changes/events?cursor=$UPPER&limit=2"
 step "无效游标被拒绝（400）"
 req GET "/changes/events?cursor=999999"
+
+step "15. 调查封存：独立批次线演示（投入链 + 相邻设备残留链，有效清洗截断）"
+req POST /materials '{"batch_id":"RM-Q1","allergens":[],"declared_at":"2026-02-01T06:00:00Z"}'
+req POST /materials '{"batch_id":"RM-Q2","allergens":[],"declared_at":"2026-02-01T06:00:00Z"}'
+req POST /processings '{"processing_id":"Q1","equipment_id":"EQ-Q","start_utc":"2026-02-01T08:00:00Z","end_utc":"2026-02-01T09:00:00Z","inputs":["RM-Q1"],"outputs":["OUT-Q1"]}'
+req POST /processings '{"processing_id":"Q2","equipment_id":"EQ-Q","start_utc":"2026-02-01T10:00:00Z","end_utc":"2026-02-01T11:00:00Z","inputs":["RM-Q2"],"outputs":["OUT-Q2"]}'
+req POST /processings '{"processing_id":"Q3","equipment_id":"EQ-OTHER","start_utc":"2026-02-01T12:00:00Z","end_utc":"2026-02-01T13:00:00Z","inputs":["OUT-Q2"],"outputs":["OUT-Q3"]}'
+step "登记调查：封存沿 Q1->Q2 残留 与 Q2->Q3 投入链传播（与过敏原为空无关）"
+req POST /investigations '{"batch_id":"OUT-Q1","investigation_id":"INV-Q-1","reason":"共线疑似交叉接触"}'
+req GET /batches/OUT-Q2/quarantine
+req GET /batches/OUT-Q3/quarantine
+
+step "16. 封存约束：签发标签/作为投入/残留污染新产出均 409，失败不留加工或标签"
+req POST /batches/OUT-Q2/labels '{}'
+req POST /processings '{"processing_id":"Q9","equipment_id":"EQ-X","start_utc":"2026-02-02T08:00:00Z","end_utc":"2026-02-02T09:00:00Z","inputs":["OUT-Q2"],"outputs":["OUT-Q9"]}'
+req POST /processings '{"processing_id":"Q4","equipment_id":"EQ-Q","start_utc":"2026-02-01T12:00:00Z","end_utc":"2026-02-01T13:00:00Z","inputs":["RM-Q2"],"outputs":["OUT-Q4"]}'
+step "确认 Q4/Q9 未留下加工记录（404）"
+req GET /processings/Q4
+req GET /processings/Q9
+
+step "17. 有效清洗截断残留：Q1/Q2 间补登清洗后重新登记调查，闭包不再跨残留"
+req POST /cleanings '{"equipment_id":"EQ-Q","cleaned_at":"2026-02-01T09:30:00Z","verified":true}'
+req POST /investigations '{"batch_id":"OUT-Q1","investigation_id":"INV-Q-2","reason":"清洗后复核"}'
+req GET /investigations/INV-Q-2
+
+step "18. 解除只移除该调查影响；叠加/重复解除（409）/未知调查号（404）"
+req POST /investigations/INV-Q-1/release
+req GET /batches/OUT-Q3/quarantine
+req POST /investigations/INV-Q-1/release
+req POST /investigations/NOPE/release
+
+step "19. 封存状态沿用游标事件流（同分页/顺序约定）"
+QCURS="$(curl -sS "$BASE/changes/snapshot" | python3 -c 'import sys,json;print(json.load(sys.stdin)["cursor"])')"
+req POST /investigations '{"batch_id":"RM-Q2","investigation_id":"INV-Q-3","reason":"原料疑似接触"}'
+req GET "/changes/events?cursor=$QCURS&limit=20"

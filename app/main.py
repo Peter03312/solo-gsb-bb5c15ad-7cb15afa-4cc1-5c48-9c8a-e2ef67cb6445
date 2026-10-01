@@ -13,6 +13,7 @@ from .schemas import (
     CleaningCreate,
     DeclarationCreate,
     DeclarationPreviewCreate,
+    InvestigationCreate,
     LabelCreate,
     MaterialCreate,
     ProcessingCreate,
@@ -28,10 +29,11 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="过敏原溯源服务",
-    version="1.3.0",
+    version="1.4.0",
     description="共线生产食品批次的过敏原与待确认状态溯源：原料声明、加工登记、"
                 "加工投入纠正、设备残留与清洗、来源路径查询、标签签发，"
-                "声明更正/清洗撤销的预演与凭据提交，以及面向下游的游标增量变更事件订阅。",
+                "声明更正/清洗撤销的预演与凭据提交，疑似交叉接触调查封存，"
+                "以及面向下游的游标增量变更事件订阅。",
     lifespan=lifespan,
 )
 
@@ -173,6 +175,47 @@ def commit_preview(preview_id: str, conn=Depends(get_conn)):
     """凭预演凭据原子应用变更：影响本次差异的记录已变化则 409（需重新预演），
     无关记录更新不使凭据失效。返回实际影响（与预演同口径）。"""
     return service.commit_preview(conn, preview_id)
+
+
+# ---------------------------------------------------------------- 调查封存
+
+@app.post("/investigations", status_code=201, tags=["调查封存"])
+def create_investigation(data: InvestigationCreate, conn=Depends(get_conn)):
+    """登记疑似交叉接触调查并封存：以批次号、唯一调查号、原因为输入。
+
+    系统沿加工投入链及同设备相邻加工的残留链（有效清洗截断残留传播）计算
+    当前受影响批次；封存与过敏原声明是否为空无关。登记与封存状态变更在同一
+    事务内原子提交。未知批次返回 404，重复调查号返回 409。
+    """
+    return service.register_investigation(conn, data)
+
+
+@app.get("/investigations", tags=["调查封存"])
+def get_investigations(status: str | None = Query(
+                       default=None, pattern="^(open|released)$"),
+                       conn=Depends(get_conn)):
+    """查询调查列表，可按 ?status=open|released 过滤（默认全部）。"""
+    return service.list_investigations(conn, status)
+
+
+@app.get("/investigations/{investigation_id}", tags=["调查封存"])
+def get_investigation(investigation_id: str, conn=Depends(get_conn)):
+    """查询单个调查：登记信息、状态及该调查自身的受影响批次与传播路径。"""
+    return service.get_investigation(conn, investigation_id)
+
+
+@app.post("/investigations/{investigation_id}/release", tags=["调查封存"])
+def release_investigation(investigation_id: str, conn=Depends(get_conn)):
+    """解除调查封存：仅移除该调查的影响，其余叠加调查不变；与状态变更原子提交。
+    未知调查号 404，重复解除 409。"""
+    return service.release_investigation(conn, investigation_id)
+
+
+@app.get("/batches/{batch_id}/quarantine", tags=["调查封存"])
+def get_batch_quarantine(batch_id: str, conn=Depends(get_conn)):
+    """按批次查询放行状态（held/released）、仍生效的调查号及各自传播路径。
+    未知批次 404。"""
+    return service.batch_quarantine_response(conn, batch_id)
 
 
 # ---------------------------------------------------------------- 溯源查询

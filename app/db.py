@@ -61,12 +61,22 @@ CREATE TABLE IF NOT EXISTS labels (
     snapshot      TEXT NOT NULL
 );
 
+-- 调查封存：质控登记“疑似交叉接触”调查；status=open 时其传播闭包内批次全部封存。
+CREATE TABLE IF NOT EXISTS investigations (
+    investigation_id TEXT PRIMARY KEY,  -- 唯一调查号（业务提供，全库唯一）
+    root_batch_id    TEXT NOT NULL,     -- 封存起点批次（批次号、唯一调查号、原因为登记输入）
+    reason           TEXT NOT NULL,
+    status           TEXT NOT NULL,     -- open / released
+    registered_at    TEXT NOT NULL,     -- 登记时间（UTC）
+    released_at      TEXT               -- 解除时间（UTC），未解除为 NULL
+);
+
 -- 变更事件流：与业务写入同一事务落库，下游按游标（seq）增量消费。
 -- seq 全局递增；同一次操作产生的多条事件按批次号排序（插入序即批次号序）。
 CREATE TABLE IF NOT EXISTS trace_events (
     seq         INTEGER PRIMARY KEY AUTOINCREMENT,  -- 全局递增序号
-    op          TEXT NOT NULL,       -- 触发操作类型（登记/更正/撤销/预演提交等）
-    op_ref      TEXT NOT NULL,       -- JSON：操作定位信息（加工号/清洗 id/声明版本/凭据等）
+    op          TEXT NOT NULL,       -- 触发操作类型（登记/更正/撤销/调查封存/解除等）
+    op_ref      TEXT NOT NULL,       -- JSON：操作定位信息（加工号/清洗 id/调查号/凭据等）
     batch_id    TEXT NOT NULL,       -- 批次号
     kind        TEXT NOT NULL,       -- material / product
     before_view TEXT,                -- JSON：变更前完整结论与依据；新批次为 NULL
@@ -76,6 +86,22 @@ CREATE TABLE IF NOT EXISTS trace_events (
 
 CREATE INDEX IF NOT EXISTS idx_trace_events_batch ON trace_events(batch_id);
 """
+
+# 轻量迁移（幂等）：为既有库的 trace_events 增补封存视图列。
+# 封存事件与溯源事件同流同序；历史事件该两列为 NULL（兼容旧消费者）。
+_MIGRATIONS = (
+    "ALTER TABLE trace_events ADD COLUMN before_quarantine_view TEXT",
+    "ALTER TABLE trace_events ADD COLUMN quarantine_view TEXT",
+)
+
+
+def _apply_migrations(conn: sqlite3.Connection) -> None:
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(trace_events)")}
+    for stmt in _MIGRATIONS:
+        col = stmt.split("ADD COLUMN")[1].split("TEXT")[0].strip()
+        if col not in cols:
+            conn.execute(stmt)
+            cols.add(col)
 
 
 def db_path() -> str:
@@ -94,6 +120,7 @@ def init_db() -> None:
     conn = connect()
     try:
         conn.executescript(SCHEMA)
+        _apply_migrations(conn)
     finally:
         conn.close()
 
