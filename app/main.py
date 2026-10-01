@@ -13,6 +13,7 @@ from .schemas import (
     CleaningCreate,
     DeclarationCreate,
     DeclarationPreviewCreate,
+    InvestigationCreate,
     LabelCreate,
     MaterialCreate,
     ProcessingCreate,
@@ -28,10 +29,11 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="过敏原溯源服务",
-    version="1.3.0",
+    version="1.4.0",
     description="共线生产食品批次的过敏原与待确认状态溯源：原料声明、加工登记、"
                 "加工投入纠正、设备残留与清洗、来源路径查询、标签签发，"
-                "声明更正/清洗撤销的预演与凭据提交，以及面向下游的游标增量变更事件订阅。",
+                "声明更正/清洗撤销的预演与凭据提交、疑似交叉接触的调查封存，"
+                "以及面向下游的游标增量变更事件订阅。",
     lifespan=lifespan,
 )
 
@@ -179,8 +181,46 @@ def commit_preview(preview_id: str, conn=Depends(get_conn)):
 
 @app.get("/batches/{batch_id}/trace", tags=["溯源"])
 def trace_batch(batch_id: str, conn=Depends(get_conn)):
-    """实时溯源：返回每项过敏原与待确认状态的来源路径及当前有效依据。"""
+    """实时溯源：返回每项过敏原与待确认状态的来源路径及当前有效依据，
+    并附封存放行状态（是否被生效调查封存、调查号与传播路径）。"""
     return service.trace_response(conn, batch_id)
+
+
+@app.get("/batches/{batch_id}/release", tags=["调查封存"])
+def get_batch_release(batch_id: str, conn=Depends(get_conn)):
+    """按批次查询放行状态：封存状态、仍生效的调查号及各自传播路径。"""
+    return service.batch_release(conn, batch_id)
+
+
+# ---------------------------------------------------------------- 调查封存
+
+@app.post("/investigations", status_code=201, tags=["调查封存"])
+def open_investigation(data: InvestigationCreate, conn=Depends(get_conn)):
+    """疑似交叉接触：以批次号、唯一调查号和原因登记调查封存。
+
+    系统沿加工投入链及同设备相邻加工的残留链（有效清洗截断残留传播）
+    实时计算受影响批次；封存与过敏原声明是否为空无关。封存与受影响状态
+    变更在同一事务原子提交，并沿用游标事件流发布实际变化。
+    """
+    return service.open_investigation(conn, data)
+
+
+@app.get("/investigations", tags=["调查封存"])
+def list_investigations(status: str | None = None, conn=Depends(get_conn)):
+    """查询调查（可按 ?status=open/lifted 过滤），含各自封存传播路径。"""
+    return service.list_investigations(conn, status)
+
+
+@app.get("/investigations/{investigation_id}", tags=["调查封存"])
+def get_investigation(investigation_id: str, conn=Depends(get_conn)):
+    return service.get_investigation(conn, investigation_id)
+
+
+@app.post("/investigations/{investigation_id}/lift", tags=["调查封存"])
+def lift_investigation(investigation_id: str, conn=Depends(get_conn)):
+    """解除调查封存：只移除该调查自身的影响（多调查叠加时其他封存保留）；
+    重复解除/未知调查号明确报错；解除与受影响状态变更原子提交并发事件。"""
+    return service.lift_investigation(conn, investigation_id)
 
 
 # ---------------------------------------------------------------- 变更事件订阅

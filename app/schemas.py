@@ -80,6 +80,22 @@ class LabelCreate(BaseModel):
     supersedes_id: Optional[int] = None  # 关联被替代的旧标签
 
 
+class InvestigationCreate(BaseModel):
+    """疑似交叉接触调查登记：唯一调查号、疑似批次、原因。"""
+
+    investigation_id: str = Field(min_length=1)
+    batch_id: str = Field(min_length=1)
+    reason: str = Field(min_length=1)
+
+    @field_validator("investigation_id", "batch_id", "reason")
+    @classmethod
+    def _v_nonblank(cls, v):
+        v = v.strip()
+        if not v:
+            raise ValueError("不能为空")
+        return v
+
+
 # 声明更正预演请求与正式更正同构；清洗撤销预演/凭据提交无请求体，
 # 仅以路径参数（清洗 id / 预演凭据）定位。
 class DeclarationPreviewCreate(DeclarationCreate):

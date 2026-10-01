@@ -21,6 +21,13 @@
   完整结论与依据）；业务写入与事件同事务，失败/预演/无实际变化不产事件；
 - 无效时序、来源环、设备时间重叠、批次来源冲突一律**拒绝并保持原状态**
   （校验与写入在同一事务内，失败即回滚）。
+- **疑似交叉接触调查封存**：质控以批次号、唯一调查号、原因登记调查；系统沿**加工投入链**
+  及**同设备相邻加工的残留链**（有效清洗截断残留传播）实时计算受影响批次；
+  **封存与过敏原声明是否为空无关**。按批次可查询放行状态、仍生效调查号与各自传播路径；
+  多调查叠加时解除其中一个只移除该调查自身的影响。封存批次**不得签发新标签、不得
+  作为新加工投入**；若设备残留会使新加工产出受封存影响，加工登记同样拒绝，失败不留
+  加工或标签。投入纠正、清洗登记/撤销、调查登记/解除后同步重算封存状态，
+  并沿用游标事件流发布实际变化；旧标签快照不变，既有溯源结论字段保持兼容。
 
 ## 快速启动
 
@@ -92,16 +99,22 @@ pytest tests/ -q
 | POST | `/cleanings/{id}/revoke` | 撤销清洗验证 |
 | POST | `/cleanings/{id}/revoke/preview` | 清洗撤销预演（不落库），返回差异报告 + 提交凭据 |
 | POST | `/previews/{preview_id}/commit` | 凭预演凭据原子应用变更（一次性） |
-| GET | `/batches/{batch_id}/trace` | 实时溯源：每项过敏原/待确认的来源路径 + 依据 |
-| POST | `/batches/{batch_id}/labels` | 签发标签（可带 `supersedes_id` 关联旧版） |
+| GET | `/batches/{batch_id}/trace` | 实时溯源：每项过敏原/待确认的来源路径 + 依据 + 封存状态 |
+| GET | `/batches/{batch_id}/release` | 按批次查询放行状态：封存状态、仍生效调查号与各自传播路径 |
+| POST | `/investigations` | 登记疑似交叉接触调查封存（批次号 + 唯一调查号 + 原因） |
+| GET | `/investigations` / `/investigations/{id}` | 查询调查（可按 `?status=open/lifted` 过滤）及受影响批次/路径 |
+| POST | `/investigations/{id}/lift` | 解除调查封存（仅移除该调查自身的影响；重复解除报错） |
+| POST | `/batches/{batch_id}/labels` | 签发标签（封存批次拒绝；可带 `supersedes_id` 关联旧版） |
 | GET | `/batches/{batch_id}/labels` / `/labels/{id}` | 查询标签 |
 | GET | `/changes/snapshot` | 初始化读取：同一状态下的现存批次实时结论 + 游标 |
 | GET | `/changes/events` | 按游标分页读取变更事件（固定上界，无效游标拒绝） |
 
-错误约定：`400` 无效时序/参数（如投入批次在加工开始前不可用、无效游标）；
+错误约定：`400` 无效时序/参数（如投入批次在加工开始前不可用、无效游标、
+登记调查时批次未知、非法 `status` 过滤）；
 `404` 资源不存在；`409` 冲突（设备时间重叠、来源环、批次号占用、重复撤销、
+重复调查号、重复解除、对封存批次签发标签或以封存批次/受封存残留登记新加工、
 预演凭据不存在/已使用/已过期，或影响差异的记录已变化需重新预演）；
-`422` 请求格式错误（如时间缺少时区）。所有时间必须为带时区的 ISO8601（建议 UTC `Z`）。
+`422` 请求格式错误（如时间缺少时区、调查字段为空白）。所有时间必须为带时区的 ISO8601（建议 UTC `Z`）。
 
 ## 变更预演（dry-run）与凭据提交
 
@@ -222,7 +235,10 @@ curl -s $BASE/batches/OUT-OAT-1/trace
   （原料更正，含预演提交，`op_ref.via` 区分 `direct` / `preview_commit`）、
   `processing_register`（加工登记）、`processing_input_correction`（加工投入纠正，
   `op_ref` 为 `{"processing_id": ...}`）、`cleaning_register`（清洗登记）、
-  `cleaning_revocation`（清洗撤销，含预演提交）。
+  `cleaning_revocation`（清洗撤销，含预演提交）、`investigation_open`
+  （调查封存登记）、`investigation_lift`（调查封存解除）。
+  封存类事件的视图在既有 `conclusion`/`basis` 外新增 `release` 字段
+  （`held` + 生效调查及传播路径）；旧字段结构不变，事件重放与快照保持兼容。
 - **新批次**（原料登记、加工产出）`before` 为 `null`（前态为空）。
 - 仅为**结论、来源路径或依据确有变化**的批次生成事件；同次操作的多条事件
   按批次号排序（`seq` 升序即批次号序）。
@@ -316,15 +332,81 @@ curl -s $BASE/batches/OUT-OAT-1/labels -X POST \
 curl -s $BASE/labels/1   # 旧标签保持签发时的结论不变
 ```
 
+## 调查封存（疑似交叉接触）
+
+质控人员发现疑似交叉接触时，以**批次号、唯一调查号、原因**登记调查：
+
+```
+POST /investigations
+{"investigation_id": "INV-2026-001", "batch_id": "RM-MILK",
+ "reason": "共线生产疑似奶残留交叉接触"}
+```
+
+规则：
+
+- **封存传播与过敏原内容无关**：无论批次过敏原声明/待确认状态是否为空，传播只按
+  批次关系图计算。从疑似批次出发，沿两类边闭包传播：
+  - **加工投入链**：投入批次 → 同加工的产出（路径步骤 `via=input`）；
+  - **同设备相邻加工残留链**：上一次同设备加工产出 → 本次加工产出
+    （`via=equipment_residue` 并带 `equipment_id`）；两次加工之间存在
+    **已验证且未撤销**的清洗（端点时刻包含）时，该残留边被**截断**。
+- 登记响应的 `affected_batches[]` 给出当前全部受影响批次及**各自传播路径**
+  （根步骤 `via=investigation_root`，含调查号）；`GET /investigations?status=open`
+  可过滤，已解除调查 `affected_batches` 为空。
+- `GET /batches/{id}/release` 返回：
+  - `release_status`：`held` / `releasable`；
+  - `active_investigations[]`：**仍生效**的调查号、根批次、原因、开启时间与
+    各自传播路径；实时溯源 `/batches/{id}/trace` 同步附 `release` 字段。
+- **多调查叠加**：批次可同时被多个调查封存（调查号与路径分别保留）；
+  `POST /investigations/{id}/lift` 解除时**只移除该调查自身的影响**，
+  其他调查仍封存的批次保持封存。重复调查号 `409`、未知调查号解除 `404`、
+  重复解除 `409`、登记时未知批次 `400`、空白字段 `422`。
+- **封存约束（校验与写入同一事务，失败回滚不留痕）**：
+  - 封存批次**不得签发新标签**（`409`）；旧标签快照不变，解除后可再签；
+  - 封存批次**不得作为新加工投入**（`409`）；
+  - 新加工在同设备上会继承到封存批次的残留、且两次加工间无有效清洗截断时，
+    **登记同样拒绝**（`409`，错误信息指明封存残留批次），不留下加工或标签。
+- **同步重算**：投入纠正（允许以封存批次作为纠正后投入）、清洗登记/撤销、
+  调查登记/解除后，封存状态沿当前记录实时重算——有效清洗可解除下游封存，
+  撤销清洗会恢复封存。
+- **事件流**：封存状态变化沿用既有游标事件：`op` = `investigation_open` /
+  `investigation_lift`，`op_ref` = `{"investigation_id": ...}`；事件 `before/after`
+  为完整视图（既有 `conclusion`/`basis` 字段不变，新增 `release` 字段），
+  仅封存状态实际变化的批次按批次号顺序落事件，分页/固定上界约定不变。
+  初始化快照 `/changes/snapshot` 的每个批次也带 `release`。
+- 封存状态对下游为**附加字段**：既有溯源结论字段、标签快照结构
+  （仅 `conclusion`/`basis`）、事件重放语义完全兼容。
+
+```bash
+BASE=http://localhost:8000
+
+# 登记调查封存（批次号 + 唯一调查号 + 原因）
+curl -s $BASE/investigations -X POST -H 'Content-Type: application/json' -d '{
+  "investigation_id": "INV-2026-001",
+  "batch_id": "RM-MILK",
+  "reason": "共线生产疑似奶残留交叉接触"}'
+
+# 按批次查询放行状态、仍生效调查号与传播路径
+curl -s $BASE/batches/OUT-OAT-1/release
+
+# 封存批次的标签/新加工被拒绝（409，原子失败不留痕）
+curl -i -s $BASE/batches/OUT-OAT-1/labels -X POST -H 'Content-Type: application/json' -d '{}'
+
+# 登记有效清洗截断残留（同步重算，可能解除下游封存）或解除调查（只移除该调查影响）
+curl -s $BASE/investigations/INV-2026-001/lift -X POST
+```
+
 ## 项目结构
 
 ```
 app/
   main.py      # FastAPI 路由与错误映射
-  service.py   # 业务规则：校验、溯源计算、标签签发、变更预演、变更事件流
+  service.py   # 业务规则：校验、溯源计算、调查封存传播、标签签发、变更预演、变更事件流
   db.py        # SQLite 连接、建表、写/读事务
   schemas.py   # 请求模型（强制时区感知时间）
-tests/test_app.py   # 45 个端到端测试
+tests/test_app.py            # 45 个端到端测试（溯源/清洗/纠正/预演/标签/事件流）
+tests/test_investigations.py # 19 个调查封存端到端测试（传播/截断/叠加/约束/事件/乱序补登）
 examples/demo.sh    # 全流程 curl 演示（含变更订阅）
+examples/demo_investigations.sh  # 调查封存专项 curl 演示
 Dockerfile / docker-compose.yml / requirements*.txt
 ```

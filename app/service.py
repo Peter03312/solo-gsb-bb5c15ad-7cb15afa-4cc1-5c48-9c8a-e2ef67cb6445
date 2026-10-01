@@ -111,7 +111,8 @@ def create_material(conn: sqlite3.Connection, data) -> dict:
         kind, _ = batch_kind(conn, data.batch_id)
         if kind:
             raise Conflict(f"批次 {data.batch_id} 已存在（{kind}），不能重复登记")
-        before_views = _snapshot_views(conn)
+        releases = _all_releases(conn)
+        before_views = _snapshot_views(conn, releases)
         conn.execute(
             "INSERT INTO material_batches (batch_id, created_at) VALUES (?, ?)",
             (data.batch_id, declared_at),
@@ -122,7 +123,8 @@ def create_material(conn: sqlite3.Connection, data) -> dict:
             (data.batch_id, json.dumps(data.allergens), int(data.pending), declared_at),
         )
         _record_events(conn, "material_register",
-                       {"batch_id": data.batch_id, "version": 1}, before_views)
+                       {"batch_id": data.batch_id, "version": 1}, before_views,
+                       before_releases=releases)
     return get_material(conn, data.batch_id)
 
 
@@ -132,7 +134,8 @@ def add_declaration(conn: sqlite3.Connection, batch_id: str, data) -> dict:
         if not _material(conn, batch_id):
             raise NotFound(f"未知原料批次: {batch_id}")
         cur = _current_declaration(conn, batch_id)
-        before_views = _snapshot_views(conn)
+        releases = _all_releases(conn)
+        before_views = _snapshot_views(conn, releases)
         conn.execute(
             "INSERT INTO material_declarations (batch_id, version, allergens, pending, declared_at)"
             " VALUES (?, ?, ?, ?, ?)",
@@ -141,7 +144,7 @@ def add_declaration(conn: sqlite3.Connection, batch_id: str, data) -> dict:
         )
         _record_events(conn, "declaration_correction",
                        {"batch_id": batch_id, "new_version": cur["version"] + 1,
-                        "via": "direct"}, before_views)
+                        "via": "direct"}, before_views, before_releases=releases)
     return get_material(conn, batch_id)
 
 
@@ -218,7 +221,23 @@ def create_processing(conn: sqlite3.Connection, data) -> dict:
                     f"已有加工 {row['processing_id']}，时间重叠"
                 )
 
-        before_views = _snapshot_views(conn)
+        # 6) 封存约束（校验与登记同一事务，失败回滚不留加工）：
+        #    封存批次不得作为新加工投入；若设备残留会使本次产出受封存影响
+        #    （上一次加工产出被封存且两次加工间无有效清洗截断），同样拒绝。
+        releases = _all_releases(conn)
+        held_inputs = [i for i in data.inputs
+                       if releases.get(i, _empty_release())["held"]]
+        if held_inputs:
+            raise Conflict(
+                f"封存批次不得作为新加工投入: {sorted(held_inputs)}")
+        held_residue = _residue_held_output(
+            conn, data.equipment_id, start, releases)
+        if held_residue:
+            raise Conflict(
+                f"设备 {data.equipment_id} 的残留来自封存批次 {held_residue}"
+                f"（与本次加工之间无有效清洗截断），登记将使新加工产出受封存影响")
+
+        before_views = _snapshot_views(conn, releases)
         conn.execute(
             "INSERT INTO processings (processing_id, equipment_id, start_utc, end_utc)"
             " VALUES (?, ?, ?, ?)",
@@ -235,7 +254,8 @@ def create_processing(conn: sqlite3.Connection, data) -> dict:
                 (data.processing_id, out_id),
             )
         _record_events(conn, "processing_register",
-                       {"processing_id": data.processing_id}, before_views)
+                       {"processing_id": data.processing_id}, before_views,
+                       before_releases=releases)
     return get_processing(conn, data.processing_id)
 
 
@@ -351,8 +371,11 @@ def correct_processing_inputs(conn: sqlite3.Connection, processing_id: str,
         #    校验“替换后”的来源图中本加工产出不可到达任一新投入
         _check_no_cycle(conn, new_inputs, outputs, ignore_processing=processing_id)
 
-        # 校验通过：替换投入（原加工号/设备/时段/产出保持原值）
-        before_views = _snapshot_views(conn)
+        # 校验通过：替换投入（原加工号/设备/时段/产出保持原值）。
+        # 封存批次允许作为纠正后的投入（“投入纠正…后同步重算封存状态”）：
+        # 替换后重算，本加工产出可能因此进入/解除封存。
+        releases = _all_releases(conn)
+        before_views = _snapshot_views(conn, releases)
         conn.execute(
             "DELETE FROM processing_inputs WHERE processing_id = ?", (processing_id,))
         for in_id in new_inputs:
@@ -360,10 +383,11 @@ def correct_processing_inputs(conn: sqlite3.Connection, processing_id: str,
                 "INSERT INTO processing_inputs (processing_id, batch_id) VALUES (?, ?)",
                 (processing_id, in_id),
             )
-        # 全量重算对比：仅为结论/来源路径/依据实际变化的批次按批次号顺序落事件，
-        # 设备残留沿后续加工继续传播的批次同样自动计入。
+        # 全量重算对比：仅为结论/来源路径/依据/封存状态实际变化的批次按批次号顺序
+        # 落事件，设备残留沿后续加工继续传播的批次同样自动计入。
         _record_events(conn, "processing_input_correction",
-                       {"processing_id": processing_id}, before_views)
+                       {"processing_id": processing_id}, before_views,
+                       before_releases=releases)
     return get_processing(conn, processing_id)
 
 
@@ -371,15 +395,18 @@ def correct_processing_inputs(conn: sqlite3.Connection, processing_id: str,
 
 def create_cleaning(conn: sqlite3.Connection, data) -> dict:
     with write_tx(conn):
-        before_views = _snapshot_views(conn)
+        releases = _all_releases(conn)
+        before_views = _snapshot_views(conn, releases)
         cur = conn.execute(
             "INSERT INTO cleanings (equipment_id, cleaned_at, verified, revoked)"
             " VALUES (?, ?, ?, 0)",
             (data.equipment_id, to_store(data.cleaned_at), int(data.verified)),
         )
         cid = cur.lastrowid
-        # 未验证清洗、不在任何残留窗口内的清洗不改变实时溯源 -> 对比后无事件
-        _record_events(conn, "cleaning_register", {"cleaning_id": cid}, before_views)
+        # 未验证清洗、不在任何残留窗口内的清洗不改变实时溯源 -> 对比后无事件；
+        # 有效清洗截断残留传播，可能同时解除下游封存（release 变化计入）。
+        _record_events(conn, "cleaning_register", {"cleaning_id": cid}, before_views,
+                       before_releases=releases)
     return get_cleaning(conn, cid)
 
 
@@ -414,11 +441,205 @@ def revoke_cleaning(conn: sqlite3.Connection, cleaning_id: int) -> dict:
             raise NotFound(f"未知清洗记录: {cleaning_id}")
         if row["revoked"]:
             raise Conflict(f"清洗记录 {cleaning_id} 已撤销")
-        before_views = _snapshot_views(conn)
+        releases = _all_releases(conn)
+        before_views = _snapshot_views(conn, releases)
         conn.execute("UPDATE cleanings SET revoked = 1 WHERE id = ?", (cleaning_id,))
         _record_events(conn, "cleaning_revocation",
-                       {"cleaning_id": cleaning_id, "via": "direct"}, before_views)
+                       {"cleaning_id": cleaning_id, "via": "direct"}, before_views,
+                       before_releases=releases)
     return get_cleaning(conn, cleaning_id)
+
+
+# ---------------------------------------------------------------- 调查封存传播
+#
+# 封存传播与过敏原内容无关：只要调查生效，根批次及其沿“加工投入链 + 同设备相邻
+# 加工残留链（有效清洗截断）”可达的全部批次一律视为受封存影响。传播结果实时
+# 重算（投入纠正、清洗登记/撤销、调查登记/解除后自动更新），多个调查叠加时
+# 每批次保留各自调查号与传播路径，解除其中一个只移除该调查自身的影响。
+
+def _empty_release() -> dict:
+    return {"held": False, "investigations": []}
+
+
+def _effective_cleaning_between(conn, equipment_id: str,
+                                 prev_end: str, start: str,
+                                 extra_revoked_cleanings: set | None = None):
+    """两次相邻加工之间是否存在“已验证且未撤销”的清洗（含端点时刻）。
+    extra_revoked_cleanings：预演用，额外视为已撤销的清洗。"""
+    cleaning = conn.execute(
+        "SELECT * FROM cleanings WHERE equipment_id = ?"
+        " AND verified = 1 AND revoked = 0"
+        " AND cleaned_at >= ? AND cleaned_at <= ?"
+        " ORDER BY cleaned_at LIMIT 1",
+        (equipment_id, prev_end, start),
+    ).fetchone()
+    if cleaning and extra_revoked_cleanings \
+            and cleaning["id"] in extra_revoked_cleanings:
+        return None
+    return cleaning
+
+
+def _build_hold_graph(conn: sqlite3.Connection,
+                      extra_revoked_cleanings: set | None = None):
+    """构造封存传播用的批次 DAG：
+    - 节点：全部批次（原料/加工产出）；
+    - 投入边：加工投入批次 -> 本加工各产出（step via=input）；
+    - 残留边：若同设备“上一次加工”（end_utc <= 本次 start）与本次之间无有效
+      清洗，则上一次加工各产出 -> 本加工各产出（via=equipment_residue）。
+    同一对批次可能同时存在投入边与残留边（语义不同，分别保留）。
+    返回 (topo_order, incoming, all_batches)：
+    incoming[bid] = [(pred_batch_id, step_dict), ...]（投入边在前、残留边在后）。
+    """
+    procs = {r["processing_id"]: r for r in conn.execute(
+        "SELECT * FROM processings")}
+    inputs_of: dict[str, list[str]] = {}
+    outputs_of: dict[str, list[str]] = {}
+    for pid in procs:
+        inputs_of[pid] = sorted(r["batch_id"] for r in conn.execute(
+            "SELECT batch_id FROM processing_inputs WHERE processing_id = ?",
+            (pid,)))
+        outputs_of[pid] = sorted(r["batch_id"] for r in conn.execute(
+            "SELECT batch_id FROM processing_outputs WHERE processing_id = ?",
+            (pid,)))
+
+    batches = set(_all_batch_ids(conn))
+    incoming: dict[str, list[tuple[str, dict]]] = {b: [] for b in batches}
+    adj: dict[str, set[str]] = {b: set() for b in batches}
+    indeg: dict[str, int] = {b: 0 for b in batches}
+
+    for pid in sorted(procs):
+        proc = procs[pid]
+        outs = outputs_of[pid]
+        preds: list[tuple[str, dict]] = []
+        for in_id in inputs_of[pid]:
+            preds.append((in_id, {"batch_id": None, "processing_id": pid,
+                                 "via": "input"}))
+        prev = conn.execute(
+            "SELECT * FROM processings WHERE equipment_id = ? AND end_utc <= ?"
+            " ORDER BY end_utc DESC LIMIT 1",
+            (proc["equipment_id"], proc["start_utc"]),
+        ).fetchone()
+        residue = True
+        if prev:
+            cleaning = _effective_cleaning_between(
+                conn, proc["equipment_id"], prev["end_utc"], proc["start_utc"],
+                extra_revoked_cleanings)
+            if cleaning:
+                residue = False
+        else:
+            residue = False
+        if residue:
+            for rout in outputs_of[prev["processing_id"]]:
+                preds.append((rout, {"batch_id": None, "processing_id": pid,
+                                    "via": "equipment_residue",
+                                    "equipment_id": proc["equipment_id"]}))
+        for out_id in outs:
+            batches.add(out_id)
+            incoming.setdefault(out_id, [])
+            pred_nodes = set()
+            for pred, step_tmpl in preds:
+                step = dict(step_tmpl)
+                step["batch_id"] = out_id
+                incoming[out_id].append((pred, step))
+                pred_nodes.add(pred)
+            for pred in pred_nodes:
+                adj.setdefault(pred, set()).add(out_id)
+                adj.setdefault(out_id, set())
+                # 新产出节点可能在遍历到其加工之后才首次出现，需显式补零
+                indeg.setdefault(pred, 0)
+                indeg[out_id] = indeg.get(out_id, 0) + 1
+
+    # 拓扑排序（Kahn）：投入/残留边均由时序约束保证无环；防御性兜底。
+    ready = sorted(b for b in batches if indeg.get(b, 0) == 0)
+    topo: list[str] = []
+    while ready:
+        node = ready.pop(0)
+        topo.append(node)
+        for nxt in sorted(adj.get(node, ())):
+            indeg[nxt] -= 1
+            if indeg[nxt] == 0:
+                ready.append(nxt)
+    if len(topo) != len(batches):
+        raise Conflict("封存传播图存在环（不应发生：时序约束已排除）")
+    return topo, incoming, batches
+
+
+def _open_investigation_rows(conn: sqlite3.Connection):
+    return conn.execute(
+        "SELECT * FROM investigations WHERE status = 'open'"
+        " ORDER BY opened_at, investigation_id").fetchall()
+
+
+def _all_releases(conn: sqlite3.Connection,
+                 extra_revoked_cleanings: set | None = None) -> dict:
+    """实时计算全部批次的封存状态：
+    {batch_id: {"held": bool, "investigations": [
+        {"investigation_id", "root_batch_id", "reason", "opened_at",
+         "paths": [[step, ...]]}, ...]}}
+    每个生效调查沿传播 DAG 枚举根->批次的全部路径（枚举在拓扑序上进行）。
+    extra_revoked_cleanings：预演用（清洗撤销假设下残留边恢复，封存随之重算）。
+    """
+    topo, incoming, batches = _build_hold_graph(conn, extra_revoked_cleanings)
+    rows = _open_investigation_rows(conn)
+    releases = {b: _empty_release() for b in batches}
+    for row in rows:
+        iid, root = row["investigation_id"], row["batch_id"]
+        if root not in releases:  # 防御：根批次被删等异常情况
+            continue
+        root_step = {"batch_id": root, "via": "investigation_root",
+                     "investigation_id": iid}
+        paths_of: dict[str, list] = {}
+        per_batch: dict[str, list] = {}
+        for node in topo:
+            if node == root:
+                paths = [[root_step]]
+            elif node in incoming and incoming[node]:
+                paths = []
+                for pred, step in incoming[node]:
+                    paths.extend(p + [dict(step)] for p in paths_of.get(pred, []))
+            else:
+                paths = []
+            paths_of[node] = paths
+            if paths:
+                canon = sorted(json.dumps(p, ensure_ascii=False, sort_keys=True)
+                               for p in paths)
+                per_batch[node] = [json.loads(s) for s in canon]
+        for bid, paths in per_batch.items():
+            releases.setdefault(bid, _empty_release())
+            releases[bid]["held"] = True
+            releases[bid]["investigations"].append({
+                "investigation_id": iid,
+                "root_batch_id": root,
+                "reason": row["reason"],
+                "opened_at": iso_z(row["opened_at"]),
+                "paths": paths,
+            })
+    for rel in releases.values():
+        rel["investigations"].sort(key=lambda e: e["investigation_id"])
+    return releases
+
+
+def _residue_held_output(conn: sqlite3.Connection, equipment_id: str,
+                        start_utc: str, releases: dict) -> str | None:
+    """新加工在 start_utc 时刻是否会经设备残留继承到封存批次：
+    返回被封存的上一次加工产出批次号；被有效清洗截断或无前置加工时返回 None。"""
+    prev = conn.execute(
+        "SELECT * FROM processings WHERE equipment_id = ? AND end_utc <= ?"
+        " ORDER BY end_utc DESC LIMIT 1",
+        (equipment_id, start_utc),
+    ).fetchone()
+    if not prev:
+        return None
+    if _effective_cleaning_between(
+            conn, equipment_id, prev["end_utc"], start_utc):
+        return None
+    for r in conn.execute(
+        "SELECT batch_id FROM processing_outputs WHERE processing_id = ?",
+        (prev["processing_id"],),
+    ):
+        if releases.get(r["batch_id"], _empty_release())["held"]:
+            return r["batch_id"]
+    return None
 
 
 # ---------------------------------------------------------------- 溯源计算
@@ -560,13 +781,27 @@ def basis_view(evidence: dict) -> dict:
 
 def trace_view(conn: sqlite3.Connection, batch_id: str,
                decl_overrides: dict | None = None,
-               extra_revoked_cleanings: set | None = None) -> dict:
-    """完整实时视图：结论（含来源路径）+ 依据。可叠加预演覆盖。"""
+               extra_revoked_cleanings: set | None = None,
+               releases: dict | None = None) -> dict:
+    """完整实时视图：结论（含来源路径）+ 依据 + 封存状态。可叠加预演覆盖。"""
     result, evidence = compute_trace(
         conn, batch_id, decl_overrides, extra_revoked_cleanings)
+    release = (releases or {}).get(batch_id, _empty_release())
     return {
         "conclusion": conclusion_view(result),
         "basis": basis_view(evidence),
+        "release": release_view(release),
+    }
+
+
+def release_view(release: dict) -> dict:
+    """对外封存状态视图（与 trace/事件/快照同口径）：
+    held 为该批次是否被任一生效调查封存；investigations 给出仍生效的
+    调查号及各自传播路径（封存与过敏原声明是否为空无关）。"""
+    return {
+        "held": bool(release.get("held")),
+        "investigations": sorted(release.get("investigations", []),
+                                key=lambda e: e["investigation_id"]),
     }
 
 
@@ -574,12 +809,14 @@ def trace_response(conn: sqlite3.Connection, batch_id: str) -> dict:
     kind, _ = batch_kind(conn, batch_id)
     if not kind:
         raise NotFound(f"未知批次: {batch_id}")
-    view = trace_view(conn, batch_id)
+    releases = _all_releases(conn)
+    view = trace_view(conn, batch_id, releases=releases)
     return {
         "batch_id": batch_id,
         "kind": kind,
         **view["conclusion"],
         "basis": view["basis"],
+        "release": view["release"],
     }
 
 
@@ -591,16 +828,28 @@ def trace_response(conn: sqlite3.Connection, batch_id: str) -> dict:
 # 校验失败回滚、预演（dry-run）不落任何事件；未验证清洗、标签签发等不改变
 # 实时溯源的操作经对比自然不产生事件。
 
-def _snapshot_views(conn: sqlite3.Connection) -> dict:
-    """当前全部批次的实时视图（结论 + 依据），{batch_id: view}。"""
-    return {bid: trace_view(conn, bid) for bid in _all_batch_ids(conn)}
+def _snapshot_views(conn: sqlite3.Connection,
+                    releases: dict | None = None) -> dict:
+    """当前全部批次的实时视图（结论 + 依据 + 封存状态），{batch_id: view}。
+    封存传播在一次操作内只重算一次，所有视图共用同一结果。"""
+    if releases is None:
+        releases = _all_releases(conn)
+    return {bid: trace_view(conn, bid, releases=releases)
+            for bid in _all_batch_ids(conn)}
 
 
 def _record_events(conn: sqlite3.Connection, op: str, op_ref: dict,
-                   before_views: dict) -> list[str]:
+                   before_views: dict,
+                   before_releases: dict | None = None,
+                   after_releases: dict | None = None) -> list[str]:
     """写事务内调用：重算全部批次视图并与 before_views 对比，为新批次与
-    确有变化的批次按批次号顺序落事件。返回产生事件的批次号列表。"""
-    after_views = _snapshot_views(conn)
+    确有变化的批次按批次号顺序落事件。返回产生事件的批次号列表。
+    封存状态（release）变化同样计入（investigation_open/lift 操作）。
+    after_releases 显式给出时用于清洗撤销预演提交（撤销假设改变残留边）；
+    其余情况在写入后按当前库状态实时重算，保证封存状态前后对比正确。"""
+    if after_releases is None:
+        after_releases = _all_releases(conn)
+    after_views = _snapshot_views(conn, after_releases)
     changed = []
     for bid, after in after_views.items():
         before = before_views.get(bid)
@@ -648,15 +897,17 @@ def changes_snapshot(conn: sqlite3.Connection) -> dict:
     之后以该游标调用事件接口即可不重不漏地接续增量变化。"""
     with read_tx(conn):
         cursor = _max_event_seq(conn)
+        releases = _all_releases(conn)
         batches = []
         for bid in _all_batch_ids(conn):
             kind, _ = batch_kind(conn, bid)
-            view = trace_view(conn, bid)
+            view = trace_view(conn, bid, releases=releases)
             batches.append({
                 "batch_id": bid,
                 "kind": kind,
                 "conclusion": view["conclusion"],
                 "basis": view["basis"],
+                "release": view["release"],
             })
     return {"cursor": cursor, "batches": batches}
 
@@ -700,6 +951,13 @@ def issue_label(conn: sqlite3.Connection, batch_id: str, supersedes_id: int | No
         kind, _ = batch_kind(conn, batch_id)
         if not kind:
             raise NotFound(f"未知批次: {batch_id}")
+        # 封存批次不得签发新标签（旧标签快照不受影响、永不变更）
+        release = _all_releases(conn).get(batch_id, _empty_release())
+        if release["held"]:
+            held_by = sorted(e["investigation_id"]
+                             for e in release["investigations"])
+            raise Conflict(
+                f"批次 {batch_id} 已被调查封存（{held_by}），不得签发新标签")
         if supersedes_id is not None:
             old = conn.execute(
                 "SELECT * FROM labels WHERE id = ?", (supersedes_id,)).fetchone()
@@ -798,10 +1056,27 @@ def _canon_basis(b: dict) -> dict:
     }
 
 
+def _canon_release(rel: dict) -> dict:
+    return {
+        "held": bool(rel.get("held")),
+        "investigations": {
+            e["investigation_id"]: {
+                "root_batch_id": e["root_batch_id"],
+                "reason": e["reason"],
+                "opened_at": e["opened_at"],
+                "paths": sorted(
+                    json.dumps(p, sort_keys=True, ensure_ascii=False)
+                    for p in e.get("paths", [])),
+            }
+            for e in rel.get("investigations", [])},
+    }
+
+
 def _view_key(view: dict) -> str:
     payload = {
         "conclusion": _canon_conclusion(view["conclusion"]),
         "basis": _canon_basis(view["basis"]),
+        "release": _canon_release(view.get("release", _empty_release())),
     }
     return json.dumps(payload, sort_keys=True, ensure_ascii=False)
 
@@ -954,6 +1229,7 @@ def _collect_witnesses(conn: sqlite3.Connection, affected: dict,
         "processings": {},
         "cleanings": {},
         "labels": {str(i): labels[i] for i in sorted(labels)},
+        "investigations": {},
     }
 
     for bid in sorted(materials):
@@ -1008,6 +1284,26 @@ def _collect_witnesses(conn: sqlite3.Connection, affected: dict,
             None if not c else {
                 "equipment_id": c["equipment_id"], "cleaned_at": c["cleaned_at"],
                 "verified": int(c["verified"]), "revoked": int(c["revoked"])})
+
+    # 封存传播与过敏原内容无关：仅把“当前封存状态覆盖到本次受影响批次”的生效
+    # 调查纳入指纹（根在受影响集合内，或其传播闭包与受影响集合相交）。
+    # 无关链路上的调查登记/解除不使凭据失效；传播图本身的变化已由
+    # processings 指纹覆盖（新调查若因此波及受影响批次，闭包检查会命中）。
+    releases = _all_releases(conn)
+    affected_set = set(affected)
+    for inv in conn.execute(
+            "SELECT investigation_id, batch_id, reason, opened_at, lifted_at,"
+            " status FROM investigations WHERE status = 'open'"
+            " ORDER BY investigation_id"):
+        iid = inv["investigation_id"]
+        closure = {bid for bid, rel in releases.items()
+                   if any(e["investigation_id"] == iid
+                          for e in rel["investigations"])}
+        if inv["batch_id"] in affected_set or closure & affected_set:
+            witness["investigations"][iid] = {
+                "batch_id": inv["batch_id"], "reason": inv["reason"],
+                "opened_at": inv["opened_at"], "lifted_at": inv["lifted_at"],
+                "status": inv["status"]}
     return witness
 
 
@@ -1021,13 +1317,20 @@ def _fingerprint(witness: dict) -> str:
 def _evaluate(conn: sqlite3.Connection, decl_overrides: dict,
               extra_revoked: set, root_batches: set,
               root_equipment: set, forced_cleanings: set) -> dict:
-    """在前后两个视图上重算全部批次，构造受影响批次报告与凭据指纹。"""
+    """在前后两个视图上重算全部批次，构造受影响批次报告与凭据指纹。
+    过敏原视图与封存视图分开传播：声明更正不改变封存传播（before/after
+    共用同一封存状态）；清洗撤销预演会恢复残留边，封存状态按撤销后重算。"""
     affected: dict[str, dict] = {}
+
+    releases_before = _all_releases(conn)
+    releases_after = (
+        _all_releases(conn, extra_revoked) if extra_revoked else releases_before)
 
     for bid in _all_batch_ids(conn):
         kind, _ = batch_kind(conn, bid)
-        before = trace_view(conn, bid)
-        after = trace_view(conn, bid, decl_overrides, extra_revoked)
+        before = trace_view(conn, bid, releases=releases_before)
+        after = trace_view(conn, bid, decl_overrides, extra_revoked,
+                           releases=releases_after)
         if _view_key(before) != _view_key(after):
             affected[bid] = {"kind": kind, "before": before, "after": after}
 
@@ -1167,7 +1470,8 @@ def commit_declaration(conn: sqlite3.Connection, preview_id: str) -> dict:
             raise Conflict(
                 "影响本次差异的记录自预演后已变化，请重新预演后再提交"
                 "（无关记录更新不影响凭据）")
-        before_views = _snapshot_views(conn)
+        releases = _all_releases(conn)
+        before_views = _snapshot_views(conn, releases)
         conn.execute(
             "INSERT INTO material_declarations (batch_id, version, allergens, pending, declared_at)"
             " VALUES (?, ?, ?, ?, ?)",
@@ -1176,7 +1480,7 @@ def commit_declaration(conn: sqlite3.Connection, preview_id: str) -> dict:
         _record_events(conn, "declaration_correction",
                        {"batch_id": batch_id, "new_version": cur["version"] + 1,
                         "via": "preview_commit", "preview_id": preview_id},
-                       before_views)
+                       before_views, before_releases=releases)
         applied_at = iso_z(to_store(now_utc()))
         change = {
             "type": "declaration_correction",
@@ -1245,11 +1549,15 @@ def commit_revoke_cleaning(conn: sqlite3.Connection, preview_id: str) -> dict:
             raise Conflict(
                 "影响本次差异的记录自预演后已变化，请重新预演后再提交"
                 "（无关记录更新不影响凭据）")
-        before_views = _snapshot_views(conn)
+        releases_before = _all_releases(conn)
+        before_views = _snapshot_views(conn, releases_before)
+        releases_after = _all_releases(conn, {cleaning_id})
         conn.execute("UPDATE cleanings SET revoked = 1 WHERE id = ?", (cleaning_id,))
         _record_events(conn, "cleaning_revocation",
                        {"cleaning_id": cleaning_id, "via": "preview_commit",
-                        "preview_id": preview_id}, before_views)
+                        "preview_id": preview_id}, before_views,
+                       before_releases=releases_before,
+                       after_releases=releases_after)
         applied_at = iso_z(to_store(now_utc()))
         change = {
             "type": "cleaning_revocation",
@@ -1277,3 +1585,140 @@ def commit_preview(conn: sqlite3.Connection, preview_id: str) -> dict:
         return commit_revoke_cleaning(conn, preview_id)
     _PREVIEWS.pop(preview_id, None)
     raise Conflict("未知的预演类型，请重新预演")
+
+
+# ---------------------------------------------------------------- 调查封存
+
+def _investigation_row(conn: sqlite3.Connection, investigation_id: str):
+    return conn.execute(
+        "SELECT * FROM investigations WHERE investigation_id = ?",
+        (investigation_id,)).fetchone()
+
+
+def open_investigation(conn: sqlite3.Connection, data) -> dict:
+    """登记疑似交叉接触调查封存：唯一调查号 + 疑似批次 + 原因。
+
+    受影响批次沿加工投入链与同设备相邻加工残留链实时计算（有效清洗截断
+    残留传播）；封存与过敏原声明是否为空无关。封存/解除与受影响状态变更在
+    同一事务原子提交，并沿用游标事件流发布实际变化（按批次号顺序）。
+    """
+    with write_tx(conn):
+        if _investigation_row(conn, data.investigation_id):
+            raise Conflict(
+                f"调查号 {data.investigation_id} 已存在，不能重复登记")
+        kind, _ = batch_kind(conn, data.batch_id)
+        if not kind:
+            raise BadRequest(f"未知批次: {data.batch_id}")
+        releases = _all_releases(conn)
+        before_views = _snapshot_views(conn, releases)
+        opened_at = to_store(now_utc())
+        conn.execute(
+            "INSERT INTO investigations"
+            " (investigation_id, batch_id, reason, opened_at, lifted_at, status)"
+            " VALUES (?, ?, ?, ?, NULL, 'open')",
+            (data.investigation_id, data.batch_id, data.reason, opened_at))
+        _record_events(conn, "investigation_open",
+                       {"investigation_id": data.investigation_id},
+                       before_views, before_releases=releases)
+    return get_investigation(conn, data.investigation_id)
+
+
+def lift_investigation(conn: sqlite3.Connection, investigation_id: str) -> dict:
+    """解除调查封存：只移除该调查自身的影响；其他调查仍封存的批次保持封存。
+    重复解除（不存在/已解除）明确报错；封存解除与受影响状态变更原子提交。"""
+    with write_tx(conn):
+        row = _investigation_row(conn, investigation_id)
+        if not row:
+            raise NotFound(f"未知调查号: {investigation_id}")
+        if row["status"] != "open":
+            raise Conflict(f"调查 {investigation_id} 已解除，不能重复解除")
+        releases = _all_releases(conn)
+        before_views = _snapshot_views(conn, releases)
+        lifted_at = to_store(now_utc())
+        conn.execute(
+            "UPDATE investigations SET status = 'lifted', lifted_at = ?"
+            " WHERE investigation_id = ?",
+            (lifted_at, investigation_id))
+        _record_events(conn, "investigation_lift",
+                       {"investigation_id": investigation_id},
+                       before_views, before_releases=releases)
+    return get_investigation(conn, investigation_id)
+
+
+def _investigation_view(row, releases: dict) -> dict:
+    rel = releases.get(row["batch_id"], _empty_release())
+    entry = next((e for e in rel["investigations"]
+                  if e["investigation_id"] == row["investigation_id"]), None)
+    if entry:
+        affected = _affected_by_investigation(
+            releases, row["investigation_id"])
+        affected_batches = [
+            {"batch_id": b, "paths": affected[b]}
+            for b in sorted(affected, key=lambda b: (b != row["batch_id"], b))]
+    else:
+        affected_batches = []  # 已解除：该调查不再封存任何批次
+    return {
+        "investigation_id": row["investigation_id"],
+        "batch_id": row["batch_id"],
+        "reason": row["reason"],
+        "opened_at": iso_z(row["opened_at"]),
+        "status": row["status"],
+        "lifted_at": iso_z(row["lifted_at"]) if row["lifted_at"] else None,
+        "affected_batches": affected_batches,
+    }
+
+
+def _affected_by_investigation(releases: dict, investigation_id: str) -> dict:
+    """{batch_id: paths}：当前仍被该调查封存的批次及各自传播路径。"""
+    out: dict[str, list] = {}
+    for bid, rel in releases.items():
+        entry = next((e for e in rel["investigations"]
+                      if e["investigation_id"] == investigation_id), None)
+        if entry:
+            out[bid] = entry["paths"]
+    return out
+
+
+def get_investigation(conn: sqlite3.Connection, investigation_id: str) -> dict:
+    row = _investigation_row(conn, investigation_id)
+    if not row:
+        raise NotFound(f"未知调查号: {investigation_id}")
+    releases = _all_releases(conn)
+    return _investigation_view(row, releases)
+
+
+def list_investigations(conn: sqlite3.Connection,
+                        status: str | None = None) -> list[dict]:
+    if status not in (None, "open", "lifted"):
+        raise BadRequest("status 仅支持 open / lifted")
+    sql = "SELECT * FROM investigations"
+    params: tuple = ()
+    if status:
+        sql += " WHERE status = ?"
+        params = (status,)
+    sql += " ORDER BY opened_at, investigation_id"
+    rows = conn.execute(sql, params).fetchall()
+    releases = _all_releases(conn)
+    return [_investigation_view(r, releases) for r in rows]
+
+
+def batch_release(conn: sqlite3.Connection, batch_id: str) -> dict:
+    """按批次查询放行状态：是否封存、仍生效的调查号及各自传播路径。"""
+    kind, _ = batch_kind(conn, batch_id)
+    if not kind:
+        raise NotFound(f"未知批次: {batch_id}")
+    releases = _all_releases(conn)
+    rel = releases.get(batch_id, _empty_release())
+    return {
+        "batch_id": batch_id,
+        "kind": kind,
+        "release_status": "held" if rel["held"] else "releasable",
+        "held": rel["held"],
+        "active_investigations": [
+            {"investigation_id": e["investigation_id"],
+             "root_batch_id": e["root_batch_id"],
+             "reason": e["reason"],
+             "opened_at": e["opened_at"],
+             "paths": e["paths"]}
+            for e in rel["investigations"]],
+    }

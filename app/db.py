@@ -61,6 +61,18 @@ CREATE TABLE IF NOT EXISTS labels (
     snapshot      TEXT NOT NULL
 );
 
+-- 调查封存：QC 以“唯一调查号 + 疑似批次 + 原因”登记；受影响批次沿加工投入链
+-- 与同设备相邻加工残留链（有效清洗截断）实时传播，与过敏原声明是否为空无关。
+-- status: open（生效中）/ lifted（已解除；解除只移除该调查自身的影响）。
+CREATE TABLE IF NOT EXISTS investigations (
+    investigation_id TEXT PRIMARY KEY,
+    batch_id    TEXT NOT NULL,          -- 疑似交叉接触的根批次
+    reason      TEXT NOT NULL,
+    opened_at   TEXT NOT NULL,
+    lifted_at   TEXT,                  -- NULL = 仍生效
+    status      TEXT NOT NULL DEFAULT 'open'
+);
+
 -- 变更事件流：与业务写入同一事务落库，下游按游标（seq）增量消费。
 -- seq 全局递增；同一次操作产生的多条事件按批次号排序（插入序即批次号序）。
 CREATE TABLE IF NOT EXISTS trace_events (
